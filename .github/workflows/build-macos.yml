@@ -1,0 +1,42 @@
+name: Build macOS CLI
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+jobs:
+  macos-metal:
+    runs-on: macos-14   # Apple Silicon (arm64)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.22' }
+      - name: Build whisper.cpp (Metal, shared)
+        run: |
+          git clone --depth 1 https://github.com/ggerganov/whisper.cpp
+          cmake -S whisper.cpp -B whisper.cpp/build -DCMAKE_BUILD_TYPE=Release \
+                -DBUILD_SHARED_LIBS=ON -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON \
+                -DWHISPER_BUILD_EXAMPLES=OFF -DWHISPER_BUILD_TESTS=OFF
+          cmake --build whisper.cpp/build -j
+      - name: Stage libs/headers
+        run: |
+          mkdir -p app/lib app/inc/ggml
+          find whisper.cpp/build -name '*.dylib' -exec cp -a {} app/lib/ \;
+          cp whisper.cpp/include/whisper.h app/inc/
+          cp whisper.cpp/ggml/include/*.h app/inc/ggml/
+      - name: Build CLI (Metal)
+        run: cd app && CGO_ENABLED=1 go build -tags metal -trimpath -ldflags="-s -w" -o whisperhybrid .
+      - name: Package
+        run: |
+          mkdir -p dist && cp app/whisperhybrid dist/ && cp -a app/lib/*.dylib dist/
+          cp README.md dist/ 2>/dev/null || true
+          printf 'macOS (Apple Silicon, Metal) build. Download ggml-large-v3-turbo-q3_k.bin from the Release.\nRun: DYLD_LIBRARY_PATH=. ./whisperhybrid -model ggml-large-v3-turbo-q3_k.bin -lang en clip.wav\n(If Gatekeeper blocks it: xattr -dr com.apple.quarantine .)\n' > dist/README-MACOS.txt
+      - uses: actions/upload-artifact@v4
+        with: { name: orbination-whisper-macos-arm64-metal, path: dist }
+      - name: Attach to Release
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          tar -C dist -czf orbination-whisper-macos-arm64-metal.tar.gz .
+          gh release upload ${{ github.ref_name }} orbination-whisper-macos-arm64-metal.tar.gz --clobber
+        env: { GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}' }

@@ -1,0 +1,82 @@
+name: Build Windows CLI
+
+# Builds a native Windows (CPU) whisperhybrid.exe on a real Windows runner and
+# uploads it (with the required DLLs) as a downloadable artifact.
+# Run it from the GitHub "Actions" tab -> "Build Windows CLI" -> "Run workflow".
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+jobs:
+  windows-cpu:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup MSYS2 / MinGW toolchain
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            git make
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-go
+
+      - name: Build whisper.cpp (CPU, shared libs)
+        run: |
+          git clone --depth 1 https://github.com/ggerganov/whisper.cpp
+          cd whisper.cpp
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                -DBUILD_SHARED_LIBS=ON \
+                -DWHISPER_BUILD_EXAMPLES=OFF -DWHISPER_BUILD_TESTS=OFF
+          cmake --build build -j
+
+      - name: Stage libs and headers into app/
+        run: |
+          mkdir -p app/lib app/inc/ggml
+          # runtime DLLs
+          find whisper.cpp/build -name '*.dll' -exec cp {} app/lib/ \;
+          # MinGW import libraries (libwhisper.dll.a, etc.) for the linker
+          find whisper.cpp/build -name '*.dll.a' -exec cp {} app/lib/ \;
+          # headers
+          cp whisper.cpp/include/whisper.h app/inc/
+          cp whisper.cpp/ggml/include/*.h app/inc/ggml/
+          ls -la app/lib
+
+      - name: Build whisperhybrid.exe (CGO, CPU tag)
+        run: |
+          cd app
+          CGO_ENABLED=1 go build -trimpath -ldflags="-s -w" -o whisperhybrid.exe .
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp app/whisperhybrid.exe dist/
+          cp app/lib/*.dll dist/
+          cp README.md dist/ 2>/dev/null || true
+          cp FINAL_RESULTS.md dist/ 2>/dev/null || true
+          printf 'Orbination Whisper AI - Windows CPU CLI\n\n1) Download the model ggml-large-v3-turbo-q3_k.bin from the GitHub Release\n   and place it next to whisperhybrid.exe (or pass -model PATH).\n2) Run in PowerShell/cmd:\n   whisperhybrid.exe -model ggml-large-v3-turbo-q3_k.bin -lang en clip.wav\n   (use 16 kHz mono WAV; -lang en|es|fr|el|auto)\n3) HTTP server:\n   whisperhybrid.exe -model ggml-large-v3-turbo-q3_k.bin -serve :8080\n\nKeep the .dll files in the same folder as the .exe.\n' > dist/README-WINDOWS.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: orbination-whisper-windows-cpu
+          path: dist
+
+      # If triggered by a version tag, also attach the zip to the Release.
+      - name: Attach to Release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist/* -DestinationPath orbination-whisper-windows-cpu.zip
+          gh release upload ${{ github.ref_name }} orbination-whisper-windows-cpu.zip --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
